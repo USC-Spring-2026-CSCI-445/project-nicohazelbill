@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from typing import Optional, Tuple, List, Dict
 from argparse import ArgumentParser
-from math import inf, sqrt, atan2, pi
+from math import inf, sqrt, atan2, pi, sin, cos
 from time import sleep, time
 import queue
 import json
@@ -90,7 +90,7 @@ class RrtPlanner:
         self.map_aabb = map_aabb
         self.graph_publisher = rospy.Publisher("/rrt_graph", MarkerArray, queue_size=10)
         self.plan_visualization_pub = rospy.Publisher("/waypoints", MarkerArray, queue_size=10)
-        self.delta = 0.1
+        self.delta = 0.2
         self.obstacle_padding = 0.15
         self.goal_threshold = GOAL_THRESHOLD
 
@@ -131,13 +131,23 @@ class RrtPlanner:
     def _randomly_sample_q(self) -> Node:
         # Choose uniform randomly sampled points
         ######### Your code starts here #########
-
+        x_min, x_max, y_min, y_max = self.map_aabb
+        x_rand = np.random.uniform(x_min, x_max)
+        y_rand = np.random.uniform(y_min, y_max)
+        return Node(np.array([x_rand, y_rand]), None)
         ######### Your code ends here #########
 
     def _nearest_vertex(self, graph: List[Node], q: Node) -> Node:
         # Determine vertex nearest to sampled point
         ######### Your code starts here #########
-
+        nearest_node = None
+        min_distance = float('inf')
+        for node in graph:
+            distance = node.distance_to(q)
+            if distance < min_distance:
+                min_distance = distance
+                nearest_node = node
+        return nearest_node
         ######### Your code ends here #########
 
     def _is_in_collision(self, q_rand: Node):
@@ -157,7 +167,19 @@ class RrtPlanner:
 
         # Check if sampled point is in collision and add to tree if not
         ######### Your code starts here #########
-
+        q_near = self._nearest_vertex(graph, q_rand)
+        direction = q_rand.position - q_near.position
+        distance = np.linalg.norm(direction)
+        if distance == 0:
+            return
+        direction = direction / distance
+        q_new_position = q_near.position + self.delta * direction
+        q_new = Node(q_new_position, q_near)
+        if not self._is_in_collision(q_new):
+            graph.append(q_new)
+            q_near.neighbors.append(q_new)
+            return q_new
+        return        
         ######### Your code ends here #########
 
     def generate_plan(self, start: POSITION_TYPE, goal: POSITION_TYPE) -> Tuple[List[POSITION_TYPE], List[Node]]:
@@ -184,14 +206,105 @@ class RrtPlanner:
 
         # Find path from start to goal location through tree
         ######### Your code starts here #########
+        max_iterations = 10000
+        goal_reached = False
 
+        for i in range(max_iterations):
+            q_rand = self._randomly_sample_q()
+            q_new = self._extend(graph, q_rand)
 
+            newest_node = graph[-1]
+            if newest_node.distance_to(goal_node) < self.goal_threshold:
+                goal_reached = True
+                # Backtrack from the newest node to the start
+                current = newest_node
+                while current is not None:
+                    plan.append(current.to_dict())
+                    current = current.parent
+                plan.reverse()
+                # Add the exact goal position at the end
+                plan.append({"x": goal["x"], "y": goal["y"]})
+                break
+
+        if not goal_reached:
+            print("Goal not reached within max iterations!")
         ######### Your code ends here #########
         return plan, graph
 
 
 # Protip: copy the ObstacleFreeWaypointController class from lab5.py here
 ######### Your code starts here #########
+
+def publish_waypoints(waypoints: List[Dict], publisher: rospy.Publisher):
+    marker_array = MarkerArray()
+    for i, waypoint in enumerate(waypoints):
+        marker = Marker()
+        marker.header.frame_id = "odom"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "waypoints"
+        marker.id = i
+        marker.type = Marker.CYLINDER
+        marker.action = Marker.ADD
+        marker.pose.position = Point(waypoint["x"], waypoint["y"], 0.0)
+        marker.pose.orientation = Quaternion(0, 0, 0, 1)
+        marker.scale = Vector3(0.1, 0.1, 0.1)
+        marker.color = ColorRGBA(0.0, 1.0, 0.0, 0.5)
+        marker_array.markers.append(marker)
+    publisher.publish(marker_array)
+
+
+class ObstacleFreeWaypointController:
+    def __init__(self, waypoints: List[Dict]):
+        self.waypoints = waypoints
+        self.odom_sub = rospy.Subscriber("/odom", Odometry, self.odom_callback)
+        self.robot_ctrl_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.waypoint_pub = rospy.Publisher("/waypoints", MarkerArray, queue_size=10)
+        sleep(0.5)
+        publish_waypoints(self.waypoints, self.waypoint_pub)
+
+        self.current_position = None
+        self.linear_pid = PIDController(kP=1.0, kI=0.0, kD=0.1, kS=0.0, u_min=-0.26, u_max=0.26)
+        self.angular_pid = PIDController(kP=4.0, kI=0.0, kD=0.2, kS=0.0, u_min=-2.86, u_max=2.86)
+
+    def odom_callback(self, msg):
+        pose = msg.pose.pose
+        orientation = pose.orientation
+        _, _, theta = euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
+        self.current_position = {"x": pose.position.x, "y": pose.position.y, "theta": theta}
+
+    def calculate_error(self, goal_position: Dict) -> Optional[Tuple]:
+        if self.current_position is None:
+            return None
+        distance_error = sqrt((goal_position["x"] - self.current_position["x"]) ** 2 + (goal_position["y"] - self.current_position["y"]) ** 2)
+        angle_to_goal = atan2(goal_position["y"] - self.current_position["y"], goal_position["x"] - self.current_position["x"])
+        angle_error = atan2(sin(angle_to_goal - self.current_position["theta"]), cos(angle_to_goal - self.current_position["theta"]))
+        return distance_error, angle_error
+
+    def control_robot(self):
+        rate = rospy.Rate(20)
+        ctrl_msg = Twist()
+        current_waypoint_idx = 0
+
+        while not rospy.is_shutdown():
+            if current_waypoint_idx >= len(self.waypoints):
+                ctrl_msg.linear.x = 0.0
+                ctrl_msg.angular.z = 0.0
+                self.robot_ctrl_pub.publish(ctrl_msg)
+                rospy.loginfo("Reached all waypoints!")
+                break
+
+            goal_position = self.waypoints[current_waypoint_idx]
+            error = self.calculate_error(goal_position)
+            if error is None:
+                continue
+            distance_error, angle_error = error
+            if distance_error < GOAL_THRESHOLD:
+                current_waypoint_idx += 1
+            else:
+                ctrl_msg.linear.x = self.linear_pid.control(distance_error, rospy.get_time())
+                ctrl_msg.angular.z = self.angular_pid.control(angle_error, rospy.get_time())
+                self.robot_ctrl_pub.publish(ctrl_msg)
+            rate.sleep()
 
 ######### Your code ends here #########
 
@@ -222,7 +335,6 @@ if __name__ == "__main__":
     controller = ObstacleFreeWaypointController(plan)
 
     try:
-        while not rospy.is_shutdown():
-            controller.control_robot()
+        controller.control_robot()
     except rospy.ROSInterruptException:
         print("Shutting down...")

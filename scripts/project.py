@@ -13,8 +13,8 @@ from sensor_msgs.msg import LaserScan
 from tf.transformations import euler_from_quaternion
 
 # Import your existing implementations
-from lab8_9 import Map, ParticleFilter, angle_to_neg_pi_to_pi  # :contentReference[oaicite:2]{index=2}
-from lab10 import RrtPlanner, PIDController as WaypointPID, GOAL_THRESHOLD  # :contentReference[oaicite:3]{index=3}
+from lab8_9_starter import Map, ParticleFilter, angle_to_neg_pi_to_pi  # :contentReference[oaicite:2]{index=2}
+from lab10_starter import RrtPlanner, PIDController as WaypointPID, GOAL_THRESHOLD  # :contentReference[oaicite:3]{index=3}
 
 
 class PFRRTController:
@@ -182,6 +182,63 @@ class PFRRTController:
         """
         
         ######### Your code starts here #########
+        OBSTACLE_THRESH = 0.5 
+        FORWARD_DIST = 0.15
+        BACKUP_DIST = 0.1
+        CONVERGE_THRESH = 0.15 
+
+        for step in range(max_steps):
+            if rospy.is_shutdown():
+                break
+
+            # decide action based on front laser range
+            ranges = self.laserscan.ranges
+            mid = len(ranges) // 2
+
+            # average a small window around the front to be robust
+            window = ranges[max(0, mid - 5): min(len(ranges), mid + 5)]
+            front_range = min(window) if len(window) > 0 else 0.0
+
+            if front_range > OBSTACLE_THRESH:
+                self.move_forward(FORWARD_DIST)
+            else:
+                self.move_forward(-BACKUP_DIST)
+                # rotate a random amount to explore new directions
+                angle = np.random.uniform(0.5, 2.0) * np.random.choice([-1, 1])
+                self.rotate_in_place(angle)
+
+            # measurement update
+            self.take_measurements()
+
+            # convergence
+            particles = self._pf.particles
+            if particles is not None and len(particles) > 0:
+                # handle particles as dicts or arrays
+                if isinstance(particles[0], dict):
+                    xs = [p["x"] for p in particles]
+                    ys = [p["y"] for p in particles]
+                else:
+                    xs = [p[0] for p in particles]
+                    ys = [p[1] for p in particles]
+
+                std_x = np.std(xs)
+                std_y = np.std(ys)
+
+                if step % 20 == 0:
+                    rospy.loginfo(
+                        f"Step {step}: std_x={std_x:.3f}, std_y={std_y:.3f}"
+                    )
+
+                if std_x < CONVERGE_THRESH and std_y < CONVERGE_THRESH:
+                    rospy.loginfo(
+                        f"PF converged at step {step} "
+                        f"(std_x={std_x:.3f}, std_y={std_y:.3f})"
+                    )
+                    break
+
+        # stop the robot after localization
+        self.cmd_pub.publish(Twist())
+        rospy.loginfo("Localization phase complete.")
 
         ######### Your code ends here #########
 
@@ -195,7 +252,12 @@ class PFRRTController:
         Generate a path using RRT from PF-estimated start to known goal.
         """
         ######### Your code starts here #########
-
+        planner = self._planner
+        pf_estimate = self._pf.estimate()
+        start = {"x": pf_estimate[0], "y": pf_estimate[1]}
+        goal = self.goal_position
+        self.plan = planner.plan(start, goal)
+        self.current_wp_idx = 0
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
@@ -207,6 +269,63 @@ class PFRRTController:
         Keep updating PF along the way.
         """
         ######### Your code starts here #########
+        if self.plan is None or len(self.plan) == 0:
+            rospy.logwarn("No plan to follow!")
+            return
+
+        self.current_wp_idx = 0
+        prev_time = rospy.Time.now().to_sec()
+
+        while not rospy.is_shutdown() and self.current_wp_idx < len(self.plan):
+            wp = self.plan[self.current_wp_idx]
+            wx, wy = wp["x"], wp["y"]
+
+            # Use PF estimate as our best position guess
+            pf_est = self._pf.estimate()
+            rx, ry, rtheta = pf_est[0], pf_est[1], pf_est[2]
+
+            # Distance and heading error
+            dx = wx - rx
+            dy = wy - ry
+            dist = sqrt(dx**2 + dy**2)
+            desired_heading = atan2(dy, dx)
+            heading_error = angle_to_neg_pi_to_pi(desired_heading - rtheta)
+
+            # Check if we've reached the current waypoint
+            if dist < GOAL_THRESHOLD:
+                self.current_wp_idx += 1
+                rospy.loginfo(f"Reached waypoint {self.current_wp_idx}/{len(self.plan)}")
+                continue
+
+            # Compute dt
+            now = rospy.Time.now().to_sec()
+            dt = now - prev_time
+            if dt <= 0:
+                dt = 0.1
+            prev_time = now
+
+            # PID outputs
+            linear_vel = self.linear_pid.compute(dist, dt)
+            angular_vel = self.angular_pid.compute(heading_error, dt)
+
+            # Slow down linear speed when heading is way off
+            if abs(heading_error) > pi / 4:
+                linear_vel *= 0.3
+
+            # Publish
+            twist = Twist()
+            twist.linear.x = linear_vel
+            twist.angular.z = angular_vel
+            self.cmd_pub.publish(twist)
+
+            # Keep updating PF with measurements
+            self.take_measurements()
+
+            self.rate.sleep()
+
+        # Stop the robot
+        self.cmd_pub.publish(Twist())
+        rospy.loginfo("Plan complete – reached goal!")
 
         ######### Your code ends here #########
 
