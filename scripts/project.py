@@ -182,6 +182,8 @@ class PFRRTController:
         """
         
         ######### Your code starts here #########
+
+        # Note: might be better to just use autonmous exploration function in the pf file
         OBSTACLE_THRESH = 0.5 
         FORWARD_DIST = 0.15
         BACKUP_DIST = 0.1
