@@ -189,109 +189,264 @@ class PFRRTController:
         rate = rospy.Rate(1.0)
         rotation_attempts = 0
         move_distance = 0.25
-
+        close_count = 0
+ 
+        # Initial measurement so weights aren't all uniform
         self.take_measurements()
         rospy.sleep(0.1)
-
+ 
         for step in range(max_steps):
             if rospy.is_shutdown():
                 break
-                
+ 
             # --- Prevent getting stuck spinning ---
             if rotation_attempts > 5:
                 rospy.loginfo("Too many rotations; moving forward to escape.")
                 self.move_forward(0.3)
                 rotation_attempts = 0
-
-            # Get front range safely
+ 
+            # --- Read front cone from laser ---
             front_range = None
             too_close = False
-
+ 
             if self.laserscan is not None:
                 angle_min = self.laserscan.angle_min
                 angle_inc = self.laserscan.angle_increment
                 ranges = self.laserscan.ranges
                 num_ranges = len(ranges)
-
-                # --- FRONT WINDOW ONLY ---
-                # we look at ~ +/- 25 degrees in front of robot
+ 
+                # ±25° window in front of robot
                 front_window_deg = 25.0
                 low_angle = -math.radians(front_window_deg)
                 high_angle = math.radians(front_window_deg)
-
+ 
                 low_idx = int(round((low_angle - angle_min) / angle_inc))
                 high_idx = int(round((high_angle - angle_min) / angle_inc))
                 low_idx = max(0, min(low_idx, num_ranges - 1))
                 high_idx = max(0, min(high_idx, num_ranges - 1))
                 if low_idx > high_idx:
                     low_idx, high_idx = high_idx, low_idx
-
+ 
                 front_sector = [r for r in ranges[low_idx:high_idx + 1] if not np.isinf(r)]
-
-                # also get the exact forward beam
+ 
+                # Forward beam (angle 0)
                 zero_idx = int(round((0.0 - angle_min) / angle_inc))
                 zero_idx = max(0, min(zero_idx, num_ranges - 1))
                 front_range = ranges[zero_idx]
-
-                # decide "too close" based on this sector only
+ 
+                # Require "close" twice in a row to react (debounce noise)
                 if len(front_sector) > 0 and min(front_sector) < 0.28:
                     close_count += 1
                 else:
                     close_count = 0
-
-                # require it to be close twice in a row to react
+ 
                 if close_count >= 2:
                     too_close = True
-
+ 
+            # --- Action selection: back up + rotate, or forward, or rotate ---
             if too_close:
                 rospy.loginfo("Too close to obstacle, backing up & rotating.")
                 self.move_forward(-0.12)
-                self.rotate_in_place(uniform(math.pi / 5, math.pi / 3))  # bigger rotation away
+                self.rotate_in_place(uniform(math.pi / 5, math.pi / 3))
                 rotation_attempts += 1
                 rate.sleep()
                 continue
-
-            # --- Main motion policy ---
+ 
             if front_range is None or np.isinf(front_range) or front_range > 0.7:
-                # Move forward more confidently if clear
                 self.move_forward(move_distance)
                 rotation_attempts = 0
             else:
                 rospy.loginfo("Obstacle ahead, rotating to find new direction.")
                 self.rotate_in_place(uniform(math.pi / 4, math.pi / 2))
                 rotation_attempts += 1
-
-            # --- take PF measurements in a consistent way ---
+ 
+            # --- PF measurement update + visualization ---
+            # Note: motion is fed to the PF automatically in odom_callback,
+            # so we do NOT call self._pf.move_by here.
             self.take_measurements()
-
-            # --- visualize and check convergence ---
             self._pf.visualize_particles()
             self._pf.visualize_estimate()
-
+ 
+            # --- Convergence check ---
             x_est, y_est, theta_est = self._pf.get_estimate()
             pts = np.array([[p.x, p.y] for p in self._pf._particles])
             if pts.shape[0] > 0:
                 dists = np.linalg.norm(pts - np.array([x_est, y_est]), axis=1)
-                std_dev = np.std(dists)
-                rospy.loginfo(f"[Step {step}] Particle spread: {std_dev:.3f}")
-                
+                std_dev = float(np.std(dists))
+                rospy.loginfo("[Step %d] Particle spread: %.3f" % (step, std_dev))
+ 
                 sensor_ok = False
                 if front_range is not None and not np.isinf(front_range):
-                    # predicted front range from PF estimate
                     predicted_front = self._pf.map_.closest_distance(
                         (x_est, y_est), theta_est
                     )
                     if predicted_front is None:
                         predicted_front = 10.0
-                    # if predicted and actual are close, we believe the pose
                     if abs(predicted_front - front_range) < 0.25:
                         sensor_ok = True
-
+ 
                 if std_dev < 0.12 and sensor_ok:
                     rospy.loginfo("Particle filter converged (std < 0.12 and sensor matched).")
                     break
-
+ 
             rate.sleep()
+ 
+        # Stop the robot
+        self.cmd_pub.publish(Twist())
+        rospy.loginfo("Localization phase complete.")
+
+
+        # rate = rospy.Rate(1.0)
+        # rotation_attempts = 0
+        # move_distance = 0.25
+ 
+        # self.take_measurements()
+        # rospy.sleep(0.1)
+ 
+        # rate = rospy.Rate(10)
+        # CONFIDENCE_THRESHOLD = 0.15
+ 
+        # pf = self._pf
+ 
+        # while not rospy.is_shutdown():
+        #     xs = [p.x for p in self._pf._particles]
+        #     ys = [p.y for p in self._pf._particles]
+        #     spread = math.sqrt(np.var(xs) + np.var(ys))
+        #     rospy.loginfo("Particle spread: %.4f" % spread)
+ 
+        #     if spread < CONFIDENCE_THRESHOLD:
+        #         rospy.loginfo("Localized! Spread = %.4f" % spread)
+        #         self.cmd_pub.publish(Twist())  # was self.robot_ctrl_pub (doesn't exist on this class)
+        #         break
+ 
+        #     # Check a wider front cone for walls (roughly ±30°)
+        #     front_ranges = []
+        #     for i in list(range(0, 30)) + list(range(330, 360)):
+        #         if i < len(self.laserscan.ranges):
+        #             r = self.laserscan.ranges[i]
+        #             if r != inf and r != 0.0:
+        #                 front_ranges.append(r)
+ 
+        #     min_front = min(front_ranges) if front_ranges else 999
+ 
+        #     if min_front < 0.6:
+        #         # Wall ahead — turn away
+        #         turn = uniform(pi / 2, pi) * (1 if uniform(0, 1) > 0.5 else -1)
+        #         goal_theta = angle_to_neg_pi_to_pi(self.current_position["theta"] + turn)
+        #         start_theta = self.current_position["theta"]
+        #         self.rotate_in_place(goal_theta)
+        #         actual_turn = angle_to_neg_pi_to_pi(self.current_position["theta"] - start_theta)
+        #         self._pf.move_by(0, 0, actual_turn)
+        #     else:
+        #         self.move_forward(0.3)
+        #         x, y, theta = self._pf.get_estimate()
+        #         self._pf.move_by(0.3 * math.cos(theta), 0.3 * math.sin(theta), 0)
+ 
+        #     self.take_measurements()
+ 
+        # self.cmd_pub.publish(Twist())
+        # rospy.loginfo("Localization phase complete.")
+
+
+        # for step in range(max_steps):
+        #     if rospy.is_shutdown():
+        #         break
+                
+        #     # --- Prevent getting stuck spinning ---
+        #     if rotation_attempts > 5:
+        #         rospy.loginfo("Too many rotations; moving forward to escape.")
+        #         self.move_forward(0.3)
+        #         rotation_attempts = 0
+
+        #     # Get front range safely
+        #     front_range = None
+        #     too_close = False
+
+        #     if self.laserscan is not None:
+        #         angle_min = self.laserscan.angle_min
+        #         angle_inc = self.laserscan.angle_increment
+        #         ranges = self.laserscan.ranges
+        #         num_ranges = len(ranges)
+
+        #         # --- FRONT WINDOW ONLY ---
+        #         # we look at ~ +/- 25 degrees in front of robot
+        #         front_window_deg = 25.0
+        #         low_angle = -math.radians(front_window_deg)
+        #         high_angle = math.radians(front_window_deg)
+
+        #         low_idx = int(round((low_angle - angle_min) / angle_inc))
+        #         high_idx = int(round((high_angle - angle_min) / angle_inc))
+        #         low_idx = max(0, min(low_idx, num_ranges - 1))
+        #         high_idx = max(0, min(high_idx, num_ranges - 1))
+        #         if low_idx > high_idx:
+        #             low_idx, high_idx = high_idx, low_idx
+
+        #         front_sector = [r for r in ranges[low_idx:high_idx + 1] if not np.isinf(r)]
+
+        #         # also get the exact forward beam
+        #         zero_idx = int(round((0.0 - angle_min) / angle_inc))
+        #         zero_idx = max(0, min(zero_idx, num_ranges - 1))
+        #         front_range = ranges[zero_idx]
+
+        #         # decide "too close" based on this sector only
+        #         if len(front_sector) > 0 and min(front_sector) < 0.28:
+        #             close_count += 1
+        #         else:
+        #             close_count = 0
+
+        #         # require it to be close twice in a row to react
+        #         if close_count >= 2:
+        #             too_close = True
+
+        #     if too_close:
+        #         rospy.loginfo("Too close to obstacle, backing up & rotating.")
+        #         self.move_forward(-0.12)
+        #         self.rotate_in_place(uniform(math.pi / 5, math.pi / 3))  # bigger rotation away
+        #         rotation_attempts += 1
+        #         rate.sleep()
+        #         continue
+
+        #     # --- Main motion policy ---
+        #     if front_range is None or np.isinf(front_range) or front_range > 0.7:
+        #         # Move forward more confidently if clear
+        #         self.move_forward(move_distance)
+        #         rotation_attempts = 0
+        #     else:
+        #         rospy.loginfo("Obstacle ahead, rotating to find new direction.")
+        #         self.rotate_in_place(uniform(math.pi / 4, math.pi / 2))
+        #         rotation_attempts += 1
+
+        #     # --- take PF measurements in a consistent way ---
+        #     self.take_measurements()
+
+        #     # --- visualize and check convergence ---
+        #     self._pf.visualize_particles()
+        #     self._pf.visualize_estimate()
+
+        #     x_est, y_est, theta_est = self._pf.get_estimate()
+        #     pts = np.array([[p.x, p.y] for p in self._pf._particles])
+        #     if pts.shape[0] > 0:
+        #         dists = np.linalg.norm(pts - np.array([x_est, y_est]), axis=1)
+        #         std_dev = np.std(dists)
+        #         rospy.loginfo(f"[Step {step}] Particle spread: {std_dev:.3f}")
+                
+        #         sensor_ok = False
+        #         if front_range is not None and not np.isinf(front_range):
+        #             # predicted front range from PF estimate
+        #             predicted_front = self._pf.map_.closest_distance(
+        #                 (x_est, y_est), theta_est
+        #             )
+        #             if predicted_front is None:
+        #                 predicted_front = 10.0
+        #             # if predicted and actual are close, we believe the pose
+        #             if abs(predicted_front - front_range) < 0.25:
+        #                 sensor_ok = True
+
+        #         if std_dev < 0.12 and sensor_ok:
+        #             rospy.loginfo("Particle filter converged (std < 0.12 and sensor matched).")
+        #             break
+
+        #     rate.sleep()
 
         self.cmd_pub.publish(Twist())
         rospy.loginfo("Localization phase complete.")
@@ -308,12 +463,24 @@ class PFRRTController:
         Generate a path using RRT from PF-estimated start to known goal.
         """
         ######### Your code starts here #########
-        planner = self._planner
-        pf_estimate = self._pf.get_estimate()
-        start = {"x": pf_estimate[0], "y": pf_estimate[1]}
+        x_est, y_est, _ = self._pf.get_estimate()
+        start = {"x": x_est, "y": y_est}
         goal = self.goal_position
-        self.plan = planner.generate_plan(start, goal)
+ 
+        rospy.loginfo("Planning from (%.2f, %.2f) to (%.2f, %.2f)" %
+                      (start["x"], start["y"], goal["x"], goal["y"]))
+ 
+        # generate_plan returns (plan, graph) — must unpack both
+        plan, graph = self._planner.generate_plan(start, goal)
+        self.plan = plan
         self.current_wp_idx = 0
+ 
+        # Visualize for RViz
+        self._planner.visualize_graph(graph)
+        self._planner.visualize_plan(plan)
+ 
+        rospy.loginfo("RRT produced %d waypoints." % len(plan))
+
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
@@ -328,60 +495,90 @@ class PFRRTController:
         if self.plan is None or len(self.plan) == 0:
             rospy.logwarn("No plan to follow!")
             return
-
+ 
         self.current_wp_idx = 0
-        prev_time = rospy.Time.now().to_sec()
-
+        last_measure_time = rospy.get_time()
+        MEASURE_PERIOD = 0.5
+ 
+        MIN_DT = 1e-3
+        t0 = rospy.get_time()
+        self.linear_pid.t_prev = t0 - MIN_DT
+        self.angular_pid.t_prev = t0 - MIN_DT
+        last_pid_time = t0
+ 
+        # Compute a constant offset between PF-estimated heading and odom heading
+        # at the start of path following. We then use odom for heading throughout
+        # (odom is smooth and locally accurate) and the PF for position.
+        pf_x0, pf_y0, pf_theta0 = self._pf.get_estimate()
+        odom_theta0 = self.current_position["theta"]
+        theta_offset = angle_to_neg_pi_to_pi(pf_theta0 - odom_theta0)
+        rospy.loginfo("Heading offset (PF - odom) = %.3f rad" % theta_offset)
+ 
+        # Skip waypoints that are already behind us (within GOAL_THRESHOLD of
+        # current PF position), so we don't try to drive backwards to wp[0].
+        while self.current_wp_idx < len(self.plan):
+            wp = self.plan[self.current_wp_idx]
+            d = sqrt((wp["x"] - pf_x0) ** 2 + (wp["y"] - pf_y0) ** 2)
+            if d < GOAL_THRESHOLD * 1.5:
+                self.current_wp_idx += 1
+            else:
+                break
+        rospy.loginfo("Starting at waypoint %d/%d" %
+                      (self.current_wp_idx, len(self.plan)))
+ 
         while not rospy.is_shutdown() and self.current_wp_idx < len(self.plan):
             wp = self.plan[self.current_wp_idx]
             wx, wy = wp["x"], wp["y"]
-
-            # Use PF estimate as our best position guess
-            pf_est = self._pf.get_estimate()
-            rx, ry, rtheta = pf_est[0], pf_est[1], pf_est[2]
-
-            # Distance and heading error
-            dx = wx - rx
-            dy = wy - ry
-            dist = sqrt(dx**2 + dy**2)
+ 
+            # Position from PF, heading from odom (with offset to align frames).
+            pf_x, pf_y, _ = self._pf.get_estimate()
+            rtheta = angle_to_neg_pi_to_pi(
+                self.current_position["theta"] + theta_offset
+            )
+ 
+            dx = wx - pf_x
+            dy = wy - pf_y
+            dist = sqrt(dx * dx + dy * dy)
             desired_heading = atan2(dy, dx)
             heading_error = angle_to_neg_pi_to_pi(desired_heading - rtheta)
-
-            # Check if we've reached the current waypoint
+ 
             if dist < GOAL_THRESHOLD:
                 self.current_wp_idx += 1
-                rospy.loginfo(f"Reached waypoint {self.current_wp_idx}/{len(self.plan)}")
+                rospy.loginfo("Reached waypoint %d/%d" %
+                              (self.current_wp_idx, len(self.plan)))
                 continue
-
-            # Compute dt
-            now = rospy.Time.now().to_sec()
-            dt = now - prev_time
-            if dt <= 0:
-                dt = 0.1
-            prev_time = now
-
-            # PID outputs
-            linear_vel = self.linear_pid.control(dist, dt)
-            angular_vel = self.angular_pid.control(heading_error, dt)
-
-            # Slow down linear speed when heading is way off
-            if abs(heading_error) > pi / 4:
-                linear_vel *= 0.3
-
-            # Publish
+ 
+            now = rospy.get_time()
+            if now <= last_pid_time:
+                now = last_pid_time + MIN_DT
+            last_pid_time = now
+ 
+            linear_vel = self.linear_pid.control(dist, now)
+            angular_vel = self.angular_pid.control(heading_error, now)
+ 
+            # Two-phase control: rotate first, then drive.
+            # If heading is way off, don't move forward at all — just turn.
+            if abs(heading_error) > pi / 6:   # ~30 deg
+                linear_vel = 0.0
+            elif abs(heading_error) > pi / 12:  # ~15 deg
+                linear_vel *= 0.5
+ 
             twist = Twist()
             twist.linear.x = linear_vel
             twist.angular.z = angular_vel
             self.cmd_pub.publish(twist)
-
-            # Keep updating PF with measurements
-            self.take_measurements()
-
+ 
+            # Throttled PF measurement updates
+            if now - last_measure_time > MEASURE_PERIOD:
+                self.take_measurements()
+                self._pf.visualize_estimate()
+                last_measure_time = now
+ 
             self.rate.sleep()
-
-        # Stop the robot
+ 
         self.cmd_pub.publish(Twist())
         rospy.loginfo("Plan complete – reached goal!")
+
 
         ######### Your code ends here #########
 
@@ -412,10 +609,10 @@ if __name__ == "__main__":
 
     # Build map + PF + RRT
     map_obj = Map(obstacles, map_aabb)
-    num_particles = 200
-    translation_variance = 0.003
-    rotation_variance = 0.03
-    measurement_variance = 0.35
+    num_particles = 250
+    translation_variance = 0.1
+    rotation_variance = 0.05
+    measurement_variance = 0.1
 
     pf = ParticleFilter(
         map_obj,
