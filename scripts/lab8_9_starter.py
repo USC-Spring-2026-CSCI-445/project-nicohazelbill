@@ -293,80 +293,53 @@ class ParticleFilter:
         ######### Your code ends here #########
 
     def measure(self, z: float, scan_angle_in_rad: float):
-        """Update the particles based on the measurement `z` at the given `scan_angle_in_rad`.
-
-        Args:
-            z: distance to an obstacle
-            scan_angle_in_rad: Angle in the robots frame where the scan was taken
-        """
-
-        # Calculate posterior probabilities and resample
-        ######### Your code starts here #########
-        # accumulate log-likelihoods into log_p, then normalize and resample
+        # 1) Accumulate log-likelihoods. DO NOT normalize here.
         log_ps = []
         for p in self._particles:
             ray_angle_world = angle_to_neg_pi_to_pi(p.theta + scan_angle_in_rad)
             predicted = self.map_.closest_distance((p.x, p.y), ray_angle_world)
             if predicted is None:
                 predicted = max(10.0, z + 5.0)
-            try:
-                log_likelihood = scipy.stats.norm(loc=predicted, scale=self.measurement_variance).logpdf(z)
-            except Exception:
-                prob = scipy.stats.norm(predicted, self.measurement_variance).pdf(z)
-                log_likelihood = math.log(prob + 1e-12)
-            # update particle log probability (Bayes: multiply prior by likelihood => add log)
+            log_likelihood = scipy.stats.norm(
+                loc=predicted, scale=self.measurement_variance
+            ).logpdf(z)
             p.log_p = p.log_p + log_likelihood
             log_ps.append(p.log_p)
 
-        # normalize log probabilities to get weights
-        max_log = max(log_ps)
-        shifted = [math.exp(lp - max_log) for lp in log_ps]
-        total = sum(shifted)
-        if total == 0 or math.isclose(total, 0.0):
-            weights = np.ones(len(self._particles)) / float(len(self._particles))
+        # 2) Compute normalized weights (for ESS check + resampling), but do NOT
+        #    overwrite p.log_p with them.
+        log_ps_arr = np.array(log_ps)
+        max_log = np.max(log_ps_arr)
+        weights = np.exp(log_ps_arr - max_log)
+        total = weights.sum()
+        if total <= 0 or not np.isfinite(total):
+            weights = np.ones(len(self._particles)) / len(self._particles)
         else:
-            weights = np.array(shifted) / float(total)
+            weights = weights / total
 
-        # set normalized log_p for each particle
-        for p, w in zip(self._particles, weights):
-            p.log_p = math.log(max(w, 1e-300))
-
-        # resample according to weights
-        do_resample = True
+        # 3) ESS-based resampling. No artificial "wait 15 updates" delay.
         neff = 1.0 / np.sum(weights ** 2)
-        
-        if self.update_count < 15:
-            do_resample = False
-        elif neff >= 0.8 * self.n_particles:
-            do_resample = False
-            
         self.update_count += 1
-    
-        if do_resample:
+
+        if neff < 0.5 * self.n_particles:
             indices = np.random.choice(
-                range(len(self._particles)),
+                len(self._particles),
                 size=len(self._particles),
                 replace=True,
                 p=weights,
             )
             new_particles = []
+            uniform_logp = math.log(1.0 / float(self.n_particles))
             for idx in indices:
                 src = self._particles[idx]
-                new_particles.append(
-                    copy.deepcopy(
-                        Particle(
-                            src.x, src.y, src.theta,
-                            math.log(1.0 / float(self.n_particles))
-                        )
-                    )
-                )
+                # Bigger post-resample jitter to maintain diversity
+                new_particles.append(Particle(
+                    src.x + np.random.normal(0.0, 0.01),    # was 0.02 (or 0.05 earlier)
+                    src.y + np.random.normal(0.0, 0.01),
+                    angle_to_neg_pi_to_pi(src.theta + np.random.normal(0.0, 0.02)),
+                    uniform_logp,
+                ))
             self._particles = new_particles
-            
-            for p in self._particles:
-                p.x += np.random.normal(0.0, 0.01)
-                p.y += np.random.normal(0.0, 0.01)
-                p.theta = angle_to_neg_pi_to_pi(p.theta + np.random.normal(0.0, 0.01))
-        ######### Your code ends here #########
 
     def get_estimate(self) -> Tuple[float, float, float]:
         # Estimate robot's location using particle weights

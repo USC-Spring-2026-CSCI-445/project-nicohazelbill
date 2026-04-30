@@ -45,8 +45,8 @@ class PFRRTController:
         self.scan_sub = rospy.Subscriber("/scan", LaserScan, self.laserscan_callback)
 
         # PID controllers for tracking waypoints (copied from your ObstacleFreeWaypointController)
-        self.linear_pid = WaypointPID(1.0, 0.0, 0.2, 10, -0.26, 0.26)
-        self.angular_pid = WaypointPID(4.0, 0.0, 0.2, 10, -2.84, 2.84)
+        self.linear_pid = WaypointPID(1.0, 0.0, 0.2, 10, -0.22, 0.22)
+        self.angular_pid = WaypointPID(1.0, 0.0, 0.2, 10, -2.84, 2.84)
 
         # Waypoint tracking state
         self.plan: Optional[List[Dict[str, float]]] = None
@@ -140,40 +140,87 @@ class PFRRTController:
     # Measurement update
     # ----------------------------------------------------------------------
     def take_measurements(self):
-        """
-        Use 3 beams (-15°, 0°, +15° in the robot frame) from /scan
-        to update the particle filter via its measurement model.
-        """
+        """Use 4 beams (front, left, back, right) to update the PF."""
         if self.laserscan is None:
             return
 
+        range_max = getattr(self.laserscan, "range_max", 10.0)
+        beam_angles_deg = [0, 90, 180, 270]
+
+        for deg in beam_angles_deg:
+            target_angle = math.radians(deg)
+            z = self._get_beam_range(target_angle, window_deg=5.0)
+            if z is None:
+                z = range_max
+            self._pf.measure(z, target_angle)
+            
+    # ----------------------------------------------------------------------
+    # Phase 1: Localization with PF (explore a bit)
+    # ----------------------------------------------------------------------
+    def check_valid_measurements(self, r):
+        # function that does what take_measurements does to check if a measurement is valid, and if not return range_max
+        range_max = getattr(self.laserscan, "range_max", 10.0)
+        if np.isnan(r) or np.isinf(r):
+            return range_max
+        if r <= self.laserscan.range_min + 1e-3:
+            return range_max
+        return r
+    
+    def _check_pf_consistency(self):
+        """Compare PF predicted ranges vs actual laser. Returns (mean_err, max_err, std_err)."""
+        if self.laserscan is None:
+            return float('inf'), float('inf'), float('inf')
+
+        x_est, y_est, theta_est = self._pf.get_estimate()
         angle_min = self.laserscan.angle_min
         angle_increment = self.laserscan.angle_increment
         ranges = self.laserscan.ranges
         num_ranges = len(ranges)
+        range_max = getattr(self.laserscan, "range_max", 10.0)
 
-        mid_idx = num_ranges // 2
-        offset = int(15.0 / (angle_increment * 180.0 / math.pi))  # 15 degrees offset
+        beam_angles_deg = [0, 90, 180, 270]
+        errors = []
+        for deg in beam_angles_deg:
+            target_angle = math.radians(deg)
+            idx = int(round((target_angle - angle_min) / angle_increment)) % num_ranges
+            idx = max(0, min(num_ranges - 1, idx))
 
-        indices = [max(0, min(num_ranges - 1, mid_idx + i)) for i in (-offset, 0, offset)]
-        measurements = []
+            z_actual = ranges[idx]
+            if np.isinf(z_actual) or np.isnan(z_actual) or z_actual <= self.laserscan.range_min + 1e-3:
+                z_actual = range_max
 
-        for idx in indices:
-            z = ranges[idx]
-            if z == inf or np.isinf(z):
-                if hasattr(self.laserscan, "range_max"):
-                    z = self.laserscan.range_max
-                else:
-                    z = 10.0  # fallback
-            angle = angle_min + idx * angle_increment  # angle in robot frame
-            measurements.append((z, angle))
+            beam_world_angle = theta_est + (angle_min + idx * angle_increment)
+            z_predicted = self._pf.map_.closest_distance((x_est, y_est), beam_world_angle)
+            if z_predicted is None:
+                z_predicted = range_max
 
-        for z, a in measurements:
-            self._pf.measure(z, a)
+            errors.append(abs(min(z_actual, range_max) - min(z_predicted, range_max)))
 
-    # ----------------------------------------------------------------------
-    # Phase 1: Localization with PF (explore a bit)
-    # ----------------------------------------------------------------------
+        if not errors:
+            return float('inf'), float('inf'), float('inf')
+        return float(np.mean(errors)), float(max(errors)), float(np.std(errors))
+    
+    def _get_beam_range(self, target_angle_rad, window_deg=5.0):
+        angle_min = self.laserscan.angle_min
+        angle_inc = self.laserscan.angle_increment
+        ranges = self.laserscan.ranges
+        n = len(ranges)
+        range_max = getattr(self.laserscan, "range_max", 10.0)
+        range_min = self.laserscan.range_min
+
+        w = max(1, int(round(math.radians(window_deg) / angle_inc)))
+        center = int(round((target_angle_rad - angle_min) / angle_inc)) % n
+
+        valid = []
+        for off in range(-w, w + 1):
+            r = ranges[(center + off) % n]
+            if np.isnan(r) or np.isinf(r): continue
+            if r < range_min + 1e-3: continue
+            if r > range_max - 1e-3: continue
+            valid.append(r)
+
+        return float(np.median(valid)) if valid else range_max
+
     def localize_with_pf(self, max_steps: int = 400):
         """
         Simple autonomous exploration policy:
@@ -188,110 +235,134 @@ class PFRRTController:
         
         rate = rospy.Rate(1.0)
         rotation_attempts = 0
-        move_distance = 0.25
+        move_distance = 0.2
         close_count = 0
- 
-        # initial measurement so weights aren't all uniform
+
+        # Initial 360° sweep
+        rospy.loginfo("Performing initial 360° sweep for localization.")
         self.take_measurements()
-        rospy.sleep(0.1)
- 
+        self._pf.visualize_particles()
+        self._pf.visualize_estimate()
+        rospy.sleep(0.2)
+
+        for sweep_i in range(4):
+            self.rotate_in_place(math.pi / 2.0)
+            rospy.sleep(0.3)
+            self.take_measurements()
+            self._pf.visualize_particles()
+            self._pf.visualize_estimate()
+
+            x_est, y_est, theta_est = self._pf.get_estimate()
+            pts = np.array([[p.x, p.y] for p in self._pf._particles])
+            if pts.shape[0] > 0:
+                dists = np.linalg.norm(pts - np.array([x_est, y_est]), axis=1)
+                std_dev = float(np.std(dists))
+                mean_err, max_err, _ = self._check_pf_consistency()
+                rospy.loginfo("[Sweep %d/4] spread=%.3f  mean_err=%.3f  max_err=%.3f" %
+                              (sweep_i + 1, std_dev, mean_err, max_err))
+
+                if std_dev < 0.20 and mean_err < 0.15 and max_err < 0.30:
+                    rospy.loginfo("PF converged during initial sweep!")
+                    self.cmd_pub.publish(Twist())
+                    return
+
+            rospy.sleep(0.2)
+
+        rospy.loginfo("Initial sweep complete. Beginning exploration.")
+
+        good_steps = 0
+        GOOD_STEPS_NEEDED = 2
+
         for step in range(max_steps):
             if rospy.is_shutdown():
                 break
- 
-            # prevent getting stuck spinning
+
             if rotation_attempts > 5:
                 rospy.loginfo("Too many rotations; moving forward to escape.")
-                self.move_forward(0.3)
+                self.move_forward(move_distance)
                 rotation_attempts = 0
- 
-            # front cone from laser
+
             front_range = None
             too_close = False
- 
+
             if self.laserscan is not None:
-                angle_min = self.laserscan.angle_min
-                angle_inc = self.laserscan.angle_increment
                 ranges = self.laserscan.ranges
                 num_ranges = len(ranges)
- 
-                # +-25 deg window in front of robot
+                angle_inc = self.laserscan.angle_increment
+
                 front_window_deg = 25.0
-                low_angle = -math.radians(front_window_deg)
-                high_angle = math.radians(front_window_deg)
- 
-                low_idx = int(round((low_angle - angle_min) / angle_inc))
-                high_idx = int(round((high_angle - angle_min) / angle_inc))
-                low_idx = max(0, min(low_idx, num_ranges - 1))
-                high_idx = max(0, min(high_idx, num_ranges - 1))
-                if low_idx > high_idx:
-                    low_idx, high_idx = high_idx, low_idx
- 
-                front_sector = [r for r in ranges[low_idx:high_idx + 1] if not np.isinf(r)]
- 
-                # forward beam (angle 0)
-                zero_idx = int(round((0.0 - angle_min) / angle_inc))
-                zero_idx = max(0, min(zero_idx, num_ranges - 1))
-                front_range = ranges[zero_idx]
- 
-                # require "close" twice in a row to react (debounce noise)
-                if len(front_sector) > 0 and min(front_sector) < 0.28:
+                window_size = int(round(math.radians(front_window_deg) / angle_inc))
+                front_indices = (
+                    list(range(0, window_size + 1)) +
+                    list(range(num_ranges - window_size, num_ranges))
+                )
+
+                front_sector = []
+                for i in front_indices:
+                    if 0 <= i < num_ranges:
+                        r = ranges[i]
+                        if not np.isinf(r) and r != 0.0:
+                            front_sector.append(r)
+
+                front_range = ranges[0]
+                if np.isinf(front_range) or front_range == 0.0:
+                    front_range = None
+
+                if len(front_sector) > 0 and min(front_sector) < 0.07:
                     close_count += 1
                 else:
                     close_count = 0
- 
+
                 if close_count >= 2:
                     too_close = True
- 
-            # -action selection: back up + rotate, or forward, or rotate
+
+            # action selection
             if too_close:
                 rospy.loginfo("Too close to obstacle, backing up & rotating.")
-                self.move_forward(-0.12)
+                self.move_forward(-1.5 * move_distance)
                 self.rotate_in_place(uniform(math.pi / 5, math.pi / 3))
                 rotation_attempts += 1
                 rate.sleep()
                 continue
- 
-            if front_range is None or np.isinf(front_range) or front_range > 0.7:
+
+            # When close to converged, gentle rotation only — don't add translation noise
+            if good_steps >= 1:
+                rospy.loginfo("Close to convergence — gentle rotation to settle.")
+                self.rotate_in_place(uniform(-math.pi / 6, math.pi / 6))
+            elif front_range is None or np.isinf(front_range) or front_range > 0.7:
                 self.move_forward(move_distance)
                 rotation_attempts = 0
             else:
                 rospy.loginfo("Obstacle ahead, rotating to find new direction.")
                 self.rotate_in_place(uniform(math.pi / 4, math.pi / 2))
                 rotation_attempts += 1
- 
-            # PF measurement update + visualization
-            # Nmotion is fed to the PF automatically in odom_callback,
-            # so we do NOT call self._pf.move_by here.
+
             self.take_measurements()
             self._pf.visualize_particles()
             self._pf.visualize_estimate()
- 
-            # convergence check
+
+            # convergence check (all three: spread, mean_err, max_err)
             x_est, y_est, theta_est = self._pf.get_estimate()
             pts = np.array([[p.x, p.y] for p in self._pf._particles])
             if pts.shape[0] > 0:
                 dists = np.linalg.norm(pts - np.array([x_est, y_est]), axis=1)
                 std_dev = float(np.std(dists))
-                rospy.loginfo("[Step %d] Particle spread: %.3f" % (step, std_dev))
- 
-                sensor_ok = False
-                if front_range is not None and not np.isinf(front_range):
-                    predicted_front = self._pf.map_.closest_distance(
-                        (x_est, y_est), theta_est
-                    )
-                    if predicted_front is None:
-                        predicted_front = 10.0
-                    if abs(predicted_front - front_range) < 0.25:
-                        sensor_ok = True
- 
-                if std_dev < 0.12 and sensor_ok:
-                    rospy.loginfo("Particle filter converged (std < 0.12 and sensor matched).")
-                    break
- 
+                mean_err, max_err, _ = self._check_pf_consistency()
+
+                if std_dev < 0.20 and mean_err < 0.15 and max_err < 0.30:
+                    good_steps += 1
+                    rospy.loginfo("[Step %d] spread=%.3f mean_err=%.3f max_err=%.3f  GOOD (%d/%d)" %
+                                  (step, std_dev, mean_err, max_err, good_steps, GOOD_STEPS_NEEDED))
+                    if good_steps >= GOOD_STEPS_NEEDED:
+                        rospy.loginfo("PF converged: %d consecutive good steps." % GOOD_STEPS_NEEDED)
+                        break
+                else:
+                    good_steps = 0
+                    rospy.loginfo("[Step %d] spread=%.3f mean_err=%.3f max_err=%.3f" %
+                                  (step, std_dev, mean_err, max_err))
+
             rate.sleep()
- 
-        # Stop the robot
+
         self.cmd_pub.publish(Twist())
         rospy.loginfo("Localization phase complete.")
 
@@ -337,29 +408,105 @@ class PFRRTController:
         """
         ######### Your code starts here #########
 
+        # if self.plan is None or len(self.plan) == 0:
+        #     rospy.logwarn("No plan to follow!")
+        #     return
+ 
+        # # Log the full plan once at startup
+        # rospy.logwarn("=" * 50)
+        # rospy.logwarn("PLAN HAS %d WAYPOINTS:" % len(self.plan))
+        # for i, wp in enumerate(self.plan):
+        #     rospy.logwarn("  WP[%d]: (%.2f, %.2f)" % (i, wp["x"], wp["y"]))
+ 
+        # rospy.logwarn("STARTING STATE:")
+        # rospy.logwarn("  Odom: x=%.2f y=%.2f theta=%.2f" % (
+        #     self.current_position["x"],
+        #     self.current_position["y"],
+        #     self.current_position["theta"]))
+        # pf_x, pf_y, pf_t = self._pf.get_estimate()
+        # rospy.logwarn("  PF:   x=%.2f y=%.2f theta=%.2f" % (pf_x, pf_y, pf_t))
+        # rospy.logwarn("=" * 50)
+ 
+        # rate = rospy.Rate(20)
+        # ctrl_msg = Twist()
+        # current_wp_idx = 0
+        # iteration = 0
+ 
+        # MIN_DT = 1e-3
+        # t0 = rospy.get_time()
+        # self.linear_pid.t_prev = t0 - MIN_DT
+        # self.angular_pid.t_prev = t0 - MIN_DT
+        # last_pid_time = t0
+ 
+        # while not rospy.is_shutdown():
+        #     if current_wp_idx >= len(self.plan):
+        #         ctrl_msg.linear.x = 0.0
+        #         ctrl_msg.angular.z = 0.0
+        #         self.cmd_pub.publish(ctrl_msg)
+        #         rospy.loginfo("Reached all waypoints!")
+        #         break
+ 
+        #     if self.current_position is None:
+        #         rate.sleep()
+        #         continue
+ 
+        #     goal = self.plan[current_wp_idx]
+ 
+        #     # use ODOM for both position and heading (like lab10 does).
+        #     rx = self.current_position["x"]
+        #     ry = self.current_position["y"]
+        #     rtheta = self.current_position["theta"]
+ 
+        #     dx = goal["x"] - rx
+        #     dy = goal["y"] - ry
+        #     distance_error = sqrt(dx * dx + dy * dy)
+        #     angle_to_goal = atan2(dy, dx)
+        #     angle_error = atan2(
+        #         sin(angle_to_goal - rtheta),
+        #         cos(angle_to_goal - rtheta),
+        #     )
+ 
+        #     if distance_error < GOAL_THRESHOLD:
+        #         current_wp_idx += 1
+        #         rospy.logwarn("REACHED waypoint %d/%d" %
+        #                       (current_wp_idx, len(self.plan)))
+        #         rate.sleep()
+        #         continue
+ 
+        #     now = rospy.get_time()
+        #     if now <= last_pid_time:
+        #         now = last_pid_time + MIN_DT
+        #     last_pid_time = now
+ 
+        #     lin = self.linear_pid.control(distance_error, now)
+        #     ang = self.angular_pid.control(angle_error, now)
+ 
+        #     # Print state every 10 iterations (~0.5s at 20Hz)
+        #     iteration += 1
+        #     if iteration % 10 == 0:
+        #         rospy.logwarn(
+        #             "iter=%d wp=%d robot=(%.2f,%.2f,th=%.2f) "
+        #             "goal=(%.2f,%.2f) dist=%.2f ang_to_goal=%.2f "
+        #             "ang_err=%.2f -> lin=%.2f ang=%.2f" % (
+        #                 iteration, current_wp_idx, rx, ry, rtheta,
+        #                 goal["x"], goal["y"], distance_error, angle_to_goal,
+        #                 angle_error, lin, ang
+        #             ))
+ 
+        #     ctrl_msg.linear.x = lin
+        #     ctrl_msg.angular.z = ang
+        #     self.cmd_pub.publish(ctrl_msg)
+ 
+        #     rate.sleep()
+        #     rospy.sleep(0.1)  # small extra sleep to prevent CPU overload
+
         if self.plan is None or len(self.plan) == 0:
             rospy.logwarn("No plan to follow!")
             return
  
-        # Log the full plan once at startup
-        rospy.logwarn("=" * 50)
-        rospy.logwarn("PLAN HAS %d WAYPOINTS:" % len(self.plan))
-        for i, wp in enumerate(self.plan):
-            rospy.logwarn("  WP[%d]: (%.2f, %.2f)" % (i, wp["x"], wp["y"]))
- 
-        rospy.logwarn("STARTING STATE:")
-        rospy.logwarn("  Odom: x=%.2f y=%.2f theta=%.2f" % (
-            self.current_position["x"],
-            self.current_position["y"],
-            self.current_position["theta"]))
-        pf_x, pf_y, pf_t = self._pf.get_estimate()
-        rospy.logwarn("  PF:   x=%.2f y=%.2f theta=%.2f" % (pf_x, pf_y, pf_t))
-        rospy.logwarn("=" * 50)
- 
-        rate = rospy.Rate(20)
-        ctrl_msg = Twist()
-        current_wp_idx = 0
-        iteration = 0
+        self.current_wp_idx = 0
+        last_measure_time = rospy.get_time()
+        MEASURE_PERIOD = 0.5
  
         MIN_DT = 1e-3
         t0 = rospy.get_time()
@@ -367,39 +514,46 @@ class PFRRTController:
         self.angular_pid.t_prev = t0 - MIN_DT
         last_pid_time = t0
  
-        while not rospy.is_shutdown():
-            if current_wp_idx >= len(self.plan):
-                ctrl_msg.linear.x = 0.0
-                ctrl_msg.angular.z = 0.0
-                self.cmd_pub.publish(ctrl_msg)
-                rospy.loginfo("Reached all waypoints!")
+        # Compute a constant offset between PF-estimated heading and odom heading
+        # at the start of path following. We then use odom for heading throughout
+        # (odom is smooth and locally accurate) and the PF for position.
+        pf_x0, pf_y0, pf_theta0 = self._pf.get_estimate()
+        odom_theta0 = self.current_position["theta"]
+        theta_offset = angle_to_neg_pi_to_pi(pf_theta0 - odom_theta0)
+        rospy.loginfo("Heading offset (PF - odom) = %.3f rad" % theta_offset)
+ 
+        # Skip waypoints that are already behind us (within GOAL_THRESHOLD of
+        # current PF position), so we don't try to drive backwards to wp[0].
+        while self.current_wp_idx < len(self.plan):
+            wp = self.plan[self.current_wp_idx]
+            d = sqrt((wp["x"] - pf_x0) ** 2 + (wp["y"] - pf_y0) ** 2)
+            if d < GOAL_THRESHOLD * 1.5:
+                self.current_wp_idx += 1
+            else:
                 break
+        rospy.loginfo("Starting at waypoint %d/%d" %
+                      (self.current_wp_idx, len(self.plan)))
  
-            if self.current_position is None:
-                rate.sleep()
-                continue
+        while not rospy.is_shutdown() and self.current_wp_idx < len(self.plan):
+            wp = self.plan[self.current_wp_idx]
+            wx, wy = wp["x"], wp["y"]
  
-            goal = self.plan[current_wp_idx]
- 
-            # use ODOM for both position and heading (like lab10 does).
-            rx = self.current_position["x"]
-            ry = self.current_position["y"]
-            rtheta = self.current_position["theta"]
- 
-            dx = goal["x"] - rx
-            dy = goal["y"] - ry
-            distance_error = sqrt(dx * dx + dy * dy)
-            angle_to_goal = atan2(dy, dx)
-            angle_error = atan2(
-                sin(angle_to_goal - rtheta),
-                cos(angle_to_goal - rtheta),
+            # Position from PF, heading from odom (with offset to align frames).
+            pf_x, pf_y, _ = self._pf.get_estimate()
+            rtheta = angle_to_neg_pi_to_pi(
+                self.current_position["theta"] + theta_offset
             )
  
-            if distance_error < GOAL_THRESHOLD:
-                current_wp_idx += 1
-                rospy.logwarn("REACHED waypoint %d/%d" %
-                              (current_wp_idx, len(self.plan)))
-                rate.sleep()
+            dx = wx - pf_x
+            dy = wy - pf_y
+            dist = sqrt(dx * dx + dy * dy)
+            desired_heading = atan2(dy, dx)
+            heading_error = angle_to_neg_pi_to_pi(desired_heading - rtheta)
+ 
+            if dist < GOAL_THRESHOLD:
+                self.current_wp_idx += 1
+                rospy.loginfo("Reached waypoint %d/%d" %
+                              (self.current_wp_idx, len(self.plan)))
                 continue
  
             now = rospy.get_time()
@@ -407,26 +561,31 @@ class PFRRTController:
                 now = last_pid_time + MIN_DT
             last_pid_time = now
  
-            lin = self.linear_pid.control(distance_error, now)
-            ang = self.angular_pid.control(angle_error, now)
+            linear_vel = self.linear_pid.control(dist, now)
+            angular_vel = self.angular_pid.control(heading_error, now)
  
-            # Print state every 10 iterations (~0.5s at 20Hz)
-            iteration += 1
-            if iteration % 10 == 0:
-                rospy.logwarn(
-                    "iter=%d wp=%d robot=(%.2f,%.2f,th=%.2f) "
-                    "goal=(%.2f,%.2f) dist=%.2f ang_to_goal=%.2f "
-                    "ang_err=%.2f -> lin=%.2f ang=%.2f" % (
-                        iteration, current_wp_idx, rx, ry, rtheta,
-                        goal["x"], goal["y"], distance_error, angle_to_goal,
-                        angle_error, lin, ang
-                    ))
+            # Two-phase control: rotate first, then drive.
+            # If heading is way off, don't move forward at all — just turn.
+            if abs(heading_error) > pi / 6:   # ~30 deg
+                linear_vel = 0.0
+            elif abs(heading_error) > pi / 12:  # ~15 deg
+                linear_vel *= 0.5
  
-            ctrl_msg.linear.x = lin
-            ctrl_msg.angular.z = ang
-            self.cmd_pub.publish(ctrl_msg)
+            twist = Twist()
+            twist.linear.x = linear_vel
+            twist.angular.z = angular_vel
+            self.cmd_pub.publish(twist)
  
-            rate.sleep()
+            # Throttled PF measurement updates
+            if now - last_measure_time > MEASURE_PERIOD:
+                self.take_measurements()
+                self._pf.visualize_estimate()
+                last_measure_time = now
+ 
+            self.rate.sleep()
+ 
+        self.cmd_pub.publish(Twist())
+        rospy.loginfo("Plan complete – reached goal!")
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
