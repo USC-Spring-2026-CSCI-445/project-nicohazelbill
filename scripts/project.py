@@ -408,105 +408,29 @@ class PFRRTController:
         """
         ######### Your code starts here #########
 
-        # if self.plan is None or len(self.plan) == 0:
-        #     rospy.logwarn("No plan to follow!")
-        #     return
- 
-        # # Log the full plan once at startup
-        # rospy.logwarn("=" * 50)
-        # rospy.logwarn("PLAN HAS %d WAYPOINTS:" % len(self.plan))
-        # for i, wp in enumerate(self.plan):
-        #     rospy.logwarn("  WP[%d]: (%.2f, %.2f)" % (i, wp["x"], wp["y"]))
- 
-        # rospy.logwarn("STARTING STATE:")
-        # rospy.logwarn("  Odom: x=%.2f y=%.2f theta=%.2f" % (
-        #     self.current_position["x"],
-        #     self.current_position["y"],
-        #     self.current_position["theta"]))
-        # pf_x, pf_y, pf_t = self._pf.get_estimate()
-        # rospy.logwarn("  PF:   x=%.2f y=%.2f theta=%.2f" % (pf_x, pf_y, pf_t))
-        # rospy.logwarn("=" * 50)
- 
-        # rate = rospy.Rate(20)
-        # ctrl_msg = Twist()
-        # current_wp_idx = 0
-        # iteration = 0
- 
-        # MIN_DT = 1e-3
-        # t0 = rospy.get_time()
-        # self.linear_pid.t_prev = t0 - MIN_DT
-        # self.angular_pid.t_prev = t0 - MIN_DT
-        # last_pid_time = t0
- 
-        # while not rospy.is_shutdown():
-        #     if current_wp_idx >= len(self.plan):
-        #         ctrl_msg.linear.x = 0.0
-        #         ctrl_msg.angular.z = 0.0
-        #         self.cmd_pub.publish(ctrl_msg)
-        #         rospy.loginfo("Reached all waypoints!")
-        #         break
- 
-        #     if self.current_position is None:
-        #         rate.sleep()
-        #         continue
- 
-        #     goal = self.plan[current_wp_idx]
- 
-        #     # use ODOM for both position and heading (like lab10 does).
-        #     rx = self.current_position["x"]
-        #     ry = self.current_position["y"]
-        #     rtheta = self.current_position["theta"]
- 
-        #     dx = goal["x"] - rx
-        #     dy = goal["y"] - ry
-        #     distance_error = sqrt(dx * dx + dy * dy)
-        #     angle_to_goal = atan2(dy, dx)
-        #     angle_error = atan2(
-        #         sin(angle_to_goal - rtheta),
-        #         cos(angle_to_goal - rtheta),
-        #     )
- 
-        #     if distance_error < GOAL_THRESHOLD:
-        #         current_wp_idx += 1
-        #         rospy.logwarn("REACHED waypoint %d/%d" %
-        #                       (current_wp_idx, len(self.plan)))
-        #         rate.sleep()
-        #         continue
- 
-        #     now = rospy.get_time()
-        #     if now <= last_pid_time:
-        #         now = last_pid_time + MIN_DT
-        #     last_pid_time = now
- 
-        #     lin = self.linear_pid.control(distance_error, now)
-        #     ang = self.angular_pid.control(angle_error, now)
- 
-        #     # Print state every 10 iterations (~0.5s at 20Hz)
-        #     iteration += 1
-        #     if iteration % 10 == 0:
-        #         rospy.logwarn(
-        #             "iter=%d wp=%d robot=(%.2f,%.2f,th=%.2f) "
-        #             "goal=(%.2f,%.2f) dist=%.2f ang_to_goal=%.2f "
-        #             "ang_err=%.2f -> lin=%.2f ang=%.2f" % (
-        #                 iteration, current_wp_idx, rx, ry, rtheta,
-        #                 goal["x"], goal["y"], distance_error, angle_to_goal,
-        #                 angle_error, lin, ang
-        #             ))
- 
-        #     ctrl_msg.linear.x = lin
-        #     ctrl_msg.angular.z = ang
-        #     self.cmd_pub.publish(ctrl_msg)
- 
-        #     rate.sleep()
-        #     rospy.sleep(0.1)  # small extra sleep to prevent CPU overload
-
         if self.plan is None or len(self.plan) == 0:
             rospy.logwarn("No plan to follow!")
             return
  
-        self.current_wp_idx = 0
-        last_measure_time = rospy.get_time()
-        MEASURE_PERIOD = 0.5
+        # Log the full plan once at startup
+        rospy.logwarn("=" * 50)
+        rospy.logwarn("PLAN HAS %d WAYPOINTS:" % len(self.plan))
+        for i, wp in enumerate(self.plan):
+            rospy.logwarn("  WP[%d]: (%.2f, %.2f)" % (i, wp["x"], wp["y"]))
+ 
+        rospy.logwarn("STARTING STATE:")
+        rospy.logwarn("  Odom: x=%.2f y=%.2f theta=%.2f" % (
+            self.current_position["x"],
+            self.current_position["y"],
+            self.current_position["theta"]))
+        pf_x, pf_y, pf_t = self._pf.get_estimate()
+        rospy.logwarn("  PF:   x=%.2f y=%.2f theta=%.2f" % (pf_x, pf_y, pf_t))
+        rospy.logwarn("=" * 50)
+ 
+        rate = rospy.Rate(20)
+        ctrl_msg = Twist()
+        current_wp_idx = 0
+        iteration = 0
  
         MIN_DT = 1e-3
         t0 = rospy.get_time()
@@ -514,46 +438,40 @@ class PFRRTController:
         self.angular_pid.t_prev = t0 - MIN_DT
         last_pid_time = t0
  
-        # Compute a constant offset between PF-estimated heading and odom heading
-        # at the start of path following. We then use odom for heading throughout
-        # (odom is smooth and locally accurate) and the PF for position.
-        pf_x0, pf_y0, pf_theta0 = self._pf.get_estimate()
-        odom_theta0 = self.current_position["theta"]
-        theta_offset = angle_to_neg_pi_to_pi(pf_theta0 - odom_theta0)
-        rospy.loginfo("Heading offset (PF - odom) = %.3f rad" % theta_offset)
- 
-        # Skip waypoints that are already behind us (within GOAL_THRESHOLD of
-        # current PF position), so we don't try to drive backwards to wp[0].
-        while self.current_wp_idx < len(self.plan):
-            wp = self.plan[self.current_wp_idx]
-            d = sqrt((wp["x"] - pf_x0) ** 2 + (wp["y"] - pf_y0) ** 2)
-            if d < GOAL_THRESHOLD * 1.5:
-                self.current_wp_idx += 1
-            else:
+        while not rospy.is_shutdown():
+            if current_wp_idx >= len(self.plan):
+                ctrl_msg.linear.x = 0.0
+                ctrl_msg.angular.z = 0.0
+                self.cmd_pub.publish(ctrl_msg)
+                rospy.loginfo("Reached all waypoints!")
                 break
-        rospy.loginfo("Starting at waypoint %d/%d" %
-                      (self.current_wp_idx, len(self.plan)))
  
-        while not rospy.is_shutdown() and self.current_wp_idx < len(self.plan):
-            wp = self.plan[self.current_wp_idx]
-            wx, wy = wp["x"], wp["y"]
+            if self.current_position is None:
+                rate.sleep()
+                continue
  
-            # Position from PF, heading from odom (with offset to align frames).
-            pf_x, pf_y, _ = self._pf.get_estimate()
-            rtheta = angle_to_neg_pi_to_pi(
-                self.current_position["theta"] + theta_offset
+            goal = self.plan[current_wp_idx]
+ 
+            # use ODOM for both position and heading (like lab10 does).
+            # rx = self.current_position["x"]
+            # ry = self.current_position["y"]
+            # rtheta = self.current_position["theta"]
+            rx, ry, rtheta = self._pf.get_estimate()
+ 
+            dx = goal["x"] - rx
+            dy = goal["y"] - ry
+            distance_error = sqrt(dx * dx + dy * dy)
+            angle_to_goal = atan2(dy, dx)
+            angle_error = atan2(
+                sin(angle_to_goal - rtheta),
+                cos(angle_to_goal - rtheta),
             )
  
-            dx = wx - pf_x
-            dy = wy - pf_y
-            dist = sqrt(dx * dx + dy * dy)
-            desired_heading = atan2(dy, dx)
-            heading_error = angle_to_neg_pi_to_pi(desired_heading - rtheta)
- 
-            if dist < GOAL_THRESHOLD:
-                self.current_wp_idx += 1
-                rospy.loginfo("Reached waypoint %d/%d" %
-                              (self.current_wp_idx, len(self.plan)))
+            if distance_error < GOAL_THRESHOLD:
+                current_wp_idx += 1
+                rospy.logwarn("REACHED waypoint %d/%d" %
+                              (current_wp_idx, len(self.plan)))
+                rate.sleep()
                 continue
  
             now = rospy.get_time()
@@ -561,31 +479,27 @@ class PFRRTController:
                 now = last_pid_time + MIN_DT
             last_pid_time = now
  
-            linear_vel = self.linear_pid.control(dist, now)
-            angular_vel = self.angular_pid.control(heading_error, now)
+            lin = 0.3*self.linear_pid.control(distance_error, now)
+            ang = self.angular_pid.control(angle_error, now)
  
-            # Two-phase control: rotate first, then drive.
-            # If heading is way off, don't move forward at all — just turn.
-            if abs(heading_error) > pi / 6:   # ~30 deg
-                linear_vel = 0.0
-            elif abs(heading_error) > pi / 12:  # ~15 deg
-                linear_vel *= 0.5
+            # Print state every 10 iterations (~0.5s at 20Hz)
+            iteration += 1
+            if iteration % 10 == 0:
+                rospy.logwarn(
+                    "iter=%d wp=%d robot=(%.2f,%.2f,th=%.2f) "
+                    "goal=(%.2f,%.2f) dist=%.2f ang_to_goal=%.2f "
+                    "ang_err=%.2f -> lin=%.2f ang=%.2f" % (
+                        iteration, current_wp_idx, rx, ry, rtheta,
+                        goal["x"], goal["y"], distance_error, angle_to_goal,
+                        angle_error, lin, ang
+                    ))
  
-            twist = Twist()
-            twist.linear.x = linear_vel
-            twist.angular.z = angular_vel
-            self.cmd_pub.publish(twist)
+            ctrl_msg.linear.x = lin
+            ctrl_msg.angular.z = ang
+            self.cmd_pub.publish(ctrl_msg)
  
-            # Throttled PF measurement updates
-            if now - last_measure_time > MEASURE_PERIOD:
-                self.take_measurements()
-                self._pf.visualize_estimate()
-                last_measure_time = now
- 
-            self.rate.sleep()
- 
-        self.cmd_pub.publish(Twist())
-        rospy.loginfo("Plan complete – reached goal!")
+            rate.sleep()
+            rospy.sleep(0.1)  # small extra sleep to prevent CPU overload
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
